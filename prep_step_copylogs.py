@@ -22,28 +22,66 @@ def need_bin(name):
     if which(name) is None:
         err(f"Required binary '{name}' not found in PATH"); sys.exit(1)
 
-def run(cmd, input_text=None, env=None, cwd=None, logfile: Optional[Path]=None):
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE if input_text else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        env=env,
-        cwd=str(cwd) if cwd else None
-    )
-    out,_ = proc.communicate(input=input_text)
+LOG_DIR = Path("./logs").resolve()
+PROBE_TIMEOUT = 120  # сек. на короткие проверки (read_only_mode, ping, connect)
+
+def run(cmd, input_text=None, env=None, cwd=None, logfile: Optional[Path]=None, timeout=None):
+    """Запускает команду, отдаёт (rc, out). rc=124 при таймауте.
+    encoding/errors заданы явно: вывод sqlplus с кириллицей (NLS_LANG) не должен ронять скрипт."""
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=input_text,
+            stdin=None if input_text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            cwd=str(cwd) if cwd else None,
+            timeout=timeout,
+        )
+        rc, out = proc.returncode, proc.stdout or ""
+    except subprocess.TimeoutExpired as e:
+        out = e.output or ""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", errors="replace")
+        out += f"\n*** TIMEOUT after {timeout}s: {' '.join(map(str, cmd))}\n"
+        rc = 124
     if logfile:
         logfile.parent.mkdir(parents=True, exist_ok=True)
-        logfile.write_text((logfile.read_text() if logfile.exists() else "") + (out or ""))
-    return proc.returncode, out
+        with open(logfile, "a", encoding="utf-8") as f:
+            f.write(out)
+    return rc, out
 
 # ---------- sqlplus helpers ----------
 
-def sqlplus_exec(connect_str, sql, env=None, logdir=Path("./logs"), tag="session", cwd=None):
+def sqlplus_exec(user, password, alias, sql, env=None, logdir=None, tag="session", cwd=None, timeout=None):
+    """
+    Запуск sqlplus через /nolog + CONNECT из stdin:
+      * пароль не попадает в командную строку (ps) и может содержать '@', '/' и т.п.;
+      * -L: при неудачном логоне sqlplus не переспрашивает логин и не «съедает» SQL из stdin;
+      * явный EXIT в конце.
+    """
+    logdir = logdir or LOG_DIR
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    logf = logdir / f"{ts}_{tag}.log"
-    rc, out = run(["sqlplus", "-s", connect_str], input_text=sql, env=env, cwd=cwd, logfile=logf)
+    safe_tag = re.sub(r"[^\w.\-]", "_", tag)
+    logf = logdir / f"{ts}_{safe_tag}.log"
+    script = (
+        "WHENEVER OSERROR EXIT 9\n"
+        "WHENEVER SQLERROR EXIT 9\n"
+        "SET DEFINE OFF\n"  # '&' в пароле не должен считаться подстановочной переменной
+        f'CONNECT {user}/"{password}"@{alias}\n'
+        "SET DEFINE ON\n"
+        "WHENEVER OSERROR CONTINUE NONE\n"
+        "WHENEVER SQLERROR CONTINUE NONE\n"
+        f"{sql}\n"
+        "EXIT\n"
+    )
+    rc, out = run(["sqlplus", "-s", "-L", "/nolog"], input_text=script, env=env, cwd=cwd,
+                  logfile=logf, timeout=timeout)
+    if rc == 0 and ("SP2-0640" in out or "SP2-0306" in out):  # Not connected / Invalid option
+        rc = 9
     return rc, out, logf
 
 # ---------- config helpers ----------
@@ -61,16 +99,32 @@ def getenv_or_cfg(cfg, env_key, section, option, required=True):
         return str(v).strip()
     return cfg_get(cfg, section, option, required=required)
 
+
+def read_config(cfg_path: Path) -> configparser.ConfigParser:
+    if not cfg_path.is_file():
+        err(f"Config file not found: {cfg_path}"); sys.exit(1)
+    cfg = configparser.ConfigParser()
+    # config.ini содержит кириллицу — без явной кодировки падает при C/POSIX локали
+    cfg.read(cfg_path, encoding="utf-8")
+    return cfg
+
+def resolve_path(p: str, base: Path) -> Path:
+    """Относительный путь ищем от текущего каталога, затем от каталога config.ini."""
+    path = Path(p).expanduser()
+    if path.is_absolute() or path.exists():
+        return path
+    return base / path
+
 # ---------- active unit autodetect ----------
 
 def try_read_only_mode(tns_alias, um_user, um_pass, env):
     rc, out, _ = sqlplus_exec(
-        f"{um_user}/{um_pass}@{tns_alias}",
-        "whenever oserror exit 1;\nwhenever sqlerror exit 1;\nset head off pages 0 feed off\n"
+        um_user, um_pass, tns_alias,
+        "whenever sqlerror exit 1;\nset head off pages 0 feed off\n"
         "select zportal.getbuzmeparameter('read_only_mode') from dual;\n",
-        env=env, tag=f"{tns_alias}_romode"
+        env=env, tag=f"{tns_alias}_romode", timeout=PROBE_TIMEOUT
     )
-    if rc != 0 or out is None:
+    if rc != 0:
         return None
     for line in out.splitlines():
         s = line.strip()
@@ -82,94 +136,118 @@ def pick_active_from_list(aliases_csv, um_user, um_pass, env, role_expected=None
     aliases = [a.strip() for a in (aliases_csv or "").split(",") if a.strip()]
     if not aliases:
         return None, []
-    act, pas = None, []
+    act, pas = [], []
     for a in aliases:
         mode = try_read_only_mode(a, um_user, um_pass, env)
         if mode is None:
-            warn(f"Не удалось определить read_only_mode для {a} — пропускаю.")
+            warn(f"Не удалось определить read_only_mode для {a} — пропускаю (см. ./logs/*_{a}_romode.log).")
             continue
         if mode == 0:
-            act = a
+            act.append(a)
         else:
             pas.append(a)
+    role = f" (роль: {role_expected})" if role_expected else ""
     if not act:
-        err(f"Не найден активный юнит среди: {', '.join(aliases)}" + (f" (роль: {role_expected})" if role_expected else ""))
-        sys.exit(1)
-    ok(f"Определён активный юнит ({role_expected or 'DB'}): {act}" + (f"; пассивные: {', '.join(pas)}" if pas else ""))
-    return act, pas
+        err(f"Не найден активный юнит среди: {', '.join(aliases)}{role}"); sys.exit(1)
+    if len(act) > 1:
+        err(f"Несколько активных юнитов (read_only_mode = 0): {', '.join(act)}{role}"); sys.exit(1)
+    ok(f"Определён активный юнит ({role_expected or 'DB'}): {act[0]}" + (f"; пассивные: {', '.join(pas)}" if pas else ""))
+    return act[0], pas
 
 # ---------- logic pieces ----------
 
 def ensure_dblink_exists(target_db, dblink_name, um_user, um_pass, env):
     name_up = dblink_name.upper()
     check_sql = f"""
+whenever sqlerror exit 1;
 set head off pages 0 feed off
-select count(*) from user_db_links where db_link = '{name_up}';
+select count(*) from user_db_links where db_link = '{name_up}' or db_link like '{name_up}.%';
 """
-    rc, out, _ = sqlplus_exec(f"{um_user}/{um_pass}@{target_db}", check_sql, env=env, tag=f"check_dblink_{name_up}")
+    rc, out, logf = sqlplus_exec(um_user, um_pass, target_db, check_sql, env=env,
+                                 tag=f"check_dblink_{name_up}", timeout=PROBE_TIMEOUT)
     if rc != 0:
-        err(f"Failed to check DB link {name_up} on TARGET"); sys.exit(1)
+        err(f"Failed to check DB link {name_up} on TARGET (see log {logf})"); sys.exit(1)
 
-    cnt = 0
-    for line in (out or "").splitlines():
+    cnt = None
+    for line in out.splitlines():
         s = line.strip()
         if s.isdigit():
             cnt = int(s); break
+    if cnt is None:
+        err(f"Unexpected output while checking DB link {name_up} (see log {logf})"); sys.exit(1)
 
     if cnt == 0:
         say(f"{CYN}==> Creating DB link {name_up} on TARGET (UMOVE){NC}")
         create_block = f"""
-DECLARE
-  stmt VARCHAR2(4000);
+whenever sqlerror exit 1;
+set define off
 BEGIN
-  stmt := q'[CREATE DATABASE LINK {name_up}
-              CONNECT TO {um_user} IDENTIFIED BY "{um_pass}"
-              USING '{name_up}']';
-  EXECUTE IMMEDIATE stmt;
+  EXECUTE IMMEDIATE q'[CREATE DATABASE LINK {name_up} CONNECT TO {um_user} IDENTIFIED BY "{um_pass}" USING '{name_up}']';
 END;
 /
 """
-        rc2, _, _ = sqlplus_exec(f"{um_user}/{um_pass}@{target_db}", create_block, env=env, tag=f"create_dblink_{name_up}")
+        rc2, _, logf2 = sqlplus_exec(um_user, um_pass, target_db, create_block, env=env,
+                                     tag=f"create_dblink_{name_up}", timeout=PROBE_TIMEOUT)
         if rc2 != 0:
-            err(f"Failed to create DB link {name_up} on TARGET"); sys.exit(1)
+            err(f"Failed to create DB link {name_up} on TARGET (see log {logf2})"); sys.exit(1)
         ok(f"DB link {name_up} created on TARGET.")
     else:
         ok(f"DB link {name_up} already exists on TARGET.")
 
     # ping
-    ping_sql = f"whenever sqlerror exit 1;\nselect 1 from dual@{name_up};\n"
-    rc3, out3, _ = sqlplus_exec(f"{um_user}/{um_pass}@{target_db}", ping_sql, env=env, tag=f"ping_dblink_{name_up}")
-    if rc3 != 0 or "1" not in (out3 or ""):
-        err(f"DB link {name_up} exists but connectivity failed"); sys.exit(1)
+    ping_sql = f"whenever sqlerror exit 1;\nset head off pages 0 feed off\nselect 'PING_OK' from dual@{name_up};\n"
+    rc3, out3, logf3 = sqlplus_exec(um_user, um_pass, target_db, ping_sql, env=env,
+                                    tag=f"ping_dblink_{name_up}", timeout=PROBE_TIMEOUT)
+    if rc3 != 0 or "PING_OK" not in out3:
+        err(f"DB link {name_up} exists but connectivity failed (see log {logf3})"); sys.exit(1)
     ok(f"DB link {name_up} is reachable.")
 
 # ----- idempotent INSERT into zadmin.vscheduled_users (method A) -----
 
-def load_users_list(users_file: Path) -> List[str]:
-    if not users_file.exists():
+def load_users_list(users_file: Path) -> List[int]:
+    if not users_file.is_file():
         err(f"Users file not found: {users_file}"); sys.exit(1)
-    raw = users_file.read_text(encoding='utf-8')
-    tokens = re.split(r"[\s,]+", raw.strip())
-    ids = [t for t in tokens if t]
+    # utf-8-sig: файл, сохранённый в Windows с BOM, иначе даёт int('﻿123') -> ValueError
+    raw = users_file.read_text(encoding="utf-8-sig")
+    ids, bad = [], []
+    for t in re.split(r"[\s,;]+", raw.strip()):
+        if not t:
+            continue
+        if t.isdigit():
+            ids.append(int(t))
+        else:
+            bad.append(t)
+    if bad:
+        err(f"Non-numeric userid(s) in {users_file}: {', '.join(bad[:10])}{' ...' if len(bad) > 10 else ''}"); sys.exit(1)
     if not ids:
         err(f"Users file is empty: {users_file}"); sys.exit(1)
-    return ids
+    uniq = list(dict.fromkeys(ids))
+    if len(uniq) != len(ids):
+        warn(f"Removed {len(ids) - len(uniq)} duplicate userid(s) from {users_file}")
+    return uniq
+
+def build_users_in_clause(ids: List[int], column="u.userid", chunk=1000) -> str:
+    """Oracle не допускает более 1000 элементов в IN (...) — ORA-01795. Бьём на части через OR."""
+    parts = []
+    for i in range(0, len(ids), chunk):
+        parts.append(f"{column} IN ({','.join(str(x) for x in ids[i:i + chunk])})")
+    return "(" + "\n    OR ".join(parts) + ")"
 
 def build_insert_sql_method_a(target_pod: int, vip_code: str, flags: dict, users_clause: str) -> str:
+    vip_code_sql = vip_code.replace("'", "''")
     return f"""
-INSERT /*+ append */ INTO zadmin.vscheduled_users
+INSERT INTO zadmin.vscheduled_users
   (userid, podid, status, vip_code,
    ext_migrate_mss, ext_migrate_lds, ext_migrate_hit, ext_migrate_mds, ext_migrate_rcv)
 SELECT u.userid,
        {int(target_pod)},
        0,
-       '{vip_code}',
+       '{vip_code_sql}',
        {int(flags['mss'])}, {int(flags['lds'])}, {int(flags['hit'])}, {int(flags['mds'])}, {int(flags['rcv'])}
   FROM zportal.users u
  WHERE {users_clause}
    AND NOT EXISTS (SELECT 1 FROM zadmin.vscheduled_users vs
-                    WHERE vs.userid = u.userid AND vs.vip_code = '{vip_code}')
-;
+                    WHERE vs.userid = u.userid AND vs.vip_code = '{vip_code_sql}');
 COMMIT;
 """
 
@@ -178,7 +256,7 @@ COMMIT;
 def detect_tmp_argc(tmp_path: Path) -> int:
     """Return how many positional args (&1, &2) are referenced by tmp SQL."""
     try:
-        txt = tmp_path.read_text(errors="ignore")
+        txt = tmp_path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
         return 0
     argc = 0
@@ -186,23 +264,29 @@ def detect_tmp_argc(tmp_path: Path) -> int:
     if re.search(r'&\s*2\b', txt): argc = 2
     return argc
 
-def guess_transfer_no(logs_dir: Path) -> Optional[str]:
-    """Try to parse TransferNo from latest 0.1 logs."""
+def guess_transfer_no(files: List[Path]) -> Optional[str]:
+    """
+    Ищет TransferNo только в логах ТЕКУЩЕГО запуска 0.1 (раньше брались любые *.log
+    в ./logs — при неудаче текущего запуска подхватывался номер из старого прогона).
+    Берётся последнее по тексту совпадение: с 'set echo on' в начале лога лежит
+    исходник скрипта (например, 'vTransferNo number := 0'), а реальное значение — ниже.
+    """
     pats = [
-        r'\bTransfer\s*No\b[:=]\s*(\d+)',
+        r'\bTransfer\s*No\b\s*[:=]\s*(\d+)',
         r'\bTRANSFERNO\b\s*[:=]\s*(\d+)',
         r'vTransferNo\s*number\s*:?\s*=\s*(\d+)',
     ]
-    cands = sorted(list(logs_dir.glob("*precopy_session_create*.log")), key=lambda p: p.stat().st_mtime, reverse=True)
-    for p in cands:
-        try:
-            txt = p.read_text(errors="ignore")
-        except Exception:
+    for p in files:
+        if not p or not p.is_file():
             continue
+        txt = p.read_text(encoding="utf-8", errors="ignore")
+        best = None
         for rgx in pats:
-            m = re.search(rgx, txt, flags=re.IGNORECASE)
-            if m:
-                return m.group(1)
+            for m in re.finditer(rgx, txt, flags=re.IGNORECASE):
+                if best is None or m.start() > best.start():
+                    best = m
+        if best and int(best.group(1)) > 0:
+            return best.group(1)
     return None
 
 # ---------- main ----------
@@ -211,9 +295,8 @@ def main():
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} config.ini"); sys.exit(1)
 
-    cfg_path = Path(sys.argv[1])
-    cfg = configparser.ConfigParser()
-    cfg.read(cfg_path)
+    cfg_path = Path(sys.argv[1]).resolve()
+    cfg = read_config(cfg_path)
 
     # tools
     need_bin("sqlplus")
@@ -225,9 +308,9 @@ def main():
     if cfg.has_option("oracle_env", "oracle_home"):
         env["ORACLE_HOME"] = cfg.get("oracle_env", "oracle_home").strip()
     if env.get("ORACLE_HOME"):
-        env["PATH"] = f"{Path(env['ORACLE_HOME'])/ 'bin'}:{env['PATH']}"
+        env["PATH"] = f"{Path(env['ORACLE_HOME']) / 'bin'}:{env.get('PATH', '')}"
 
-    logs_dir = Path("./logs"); logs_dir.mkdir(exist_ok=True)
+    logs_dir = LOG_DIR; logs_dir.mkdir(parents=True, exist_ok=True)
 
     # creds (ENV first)
     UMOVE_USER = getenv_or_cfg(cfg, "UMOVE_USER", "db", "umove_user", required=True)
@@ -256,32 +339,29 @@ def main():
     PASSIVE_DBLINK = cfg_get(cfg, "links", "passive_src_dblink")
 
     SQL_DIR         = Path(cfg_get(cfg, "paths", "sql_dir"))
-    PRECOPY_SQL_DIR = Path(cfg.get("paths", "precopy_sql_dir", fallback=str(SQL_DIR)))
+    PRECOPY_SQL_DIR = Path(cfg.get("paths", "precopy_sql_dir", fallback=str(SQL_DIR))).resolve()
     WORK_DIR        = Path(cfg.get("paths", "work_dir", fallback=".")).resolve()
     WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-    target_pod    = int(cfg_get(cfg, "prep", "vsched_target_pod"))
-    brand_id      = int(cfg.get("prep", "brand_id", fallback="0") or 0)
-    source_pod_id = int(cfg_get(cfg, "prep", "source_pod_id"))
-    vip_code      = cfg_get(cfg, "prep", "vip_code_name")
-    flags = {
-        "mss": int(cfg_get(cfg, "prep", "ext_migrate_mss")),
-        "lds": int(cfg_get(cfg, "prep", "ext_migrate_lds")),
-        "hit": int(cfg_get(cfg, "prep", "ext_migrate_hit")),
-        "mds": int(cfg_get(cfg, "prep", "ext_migrate_mds")),
-        "rcv": int(cfg_get(cfg, "prep", "ext_migrate_rcv")),
-    }
+    try:
+        target_pod    = int(cfg_get(cfg, "prep", "vsched_target_pod"))
+        brand_id      = int(cfg.get("prep", "brand_id", fallback="0") or 0)
+        source_pod_id = int(cfg_get(cfg, "prep", "source_pod_id"))
+        flags = {k: int(cfg_get(cfg, "prep", f"ext_migrate_{k}")) for k in ("mss", "lds", "hit", "mds", "rcv")}
+    except ValueError as e:
+        err(f"Invalid numeric value in [prep] section: {e}"); sys.exit(1)
+    vip_code = cfg_get(cfg, "prep", "vip_code_name")
 
     # 0) connectivity sanity (UMOVE to both)
     say(f"{CYN}==> Checking sqlplus connectivity (UMOVE) to SOURCE {SOURCE_DB} and TARGET {TARGET_DB}{NC}")
     for alias in (SOURCE_DB, TARGET_DB):
-        rc, out, _ = sqlplus_exec(
-            f"{UMOVE_USER}/{UMOVE_PASS}@{alias}",
-            "whenever oserror exit 1;\nwhenever sqlerror exit 1;\nselect 1 from dual;\n",
-            env=env, tag=f"connect_{alias}"
+        rc, out, logf = sqlplus_exec(
+            UMOVE_USER, UMOVE_PASS, alias,
+            "whenever sqlerror exit 1;\nset head off pages 0 feed off\nselect 'CONNECT_OK' from dual;\n",
+            env=env, tag=f"connect_{alias}", timeout=PROBE_TIMEOUT
         )
-        if rc != 0 or "1" not in (out or ""):
-            err(f"Cannot connect as UMOVE to {alias}")
+        if rc != 0 or "CONNECT_OK" not in out:
+            err(f"Cannot connect as UMOVE to {alias} (see log {logf})"); sys.exit(1)
     ok("Connectivity OK")
 
     # 1) Ensure DB links on TARGET (UMOVE) and ping
@@ -293,29 +373,32 @@ def main():
     say(f"{CYN}==> Populating ZADMIN.VSCHEDULED_USERS on SOURCE via method A (idempotent){NC}")
     users_file = cfg.get("prep", "users_file", fallback="").strip()
     if users_file:
-        ids = load_users_list(Path(users_file))
-        in_list = ",".join(str(int(x)) for x in ids)
-        users_where = f"u.userid IN ({in_list})"
+        ids = load_users_list(resolve_path(users_file, cfg_path.parent))
+        say(f"    users: {len(ids)}")
+        users_where = build_users_in_clause(ids)
     else:
         users_where = cfg_get(cfg, "prep", "users_where", required=True)
 
     insert_sql = build_insert_sql_method_a(target_pod, vip_code, flags, users_where)
-    rc, _, logf = sqlplus_exec(
-        f"{UMOVE_USER}/{UMOVE_PASS}@{SOURCE_DB}",
-        f"whenever sqlerror exit 1;\nset echo on\n{insert_sql}",
+    rc, out, logf = sqlplus_exec(
+        UMOVE_USER, UMOVE_PASS, SOURCE_DB,
+        f"whenever sqlerror exit 1 rollback\nset echo on feedback on\n{insert_sql}",
         env=env, tag="insert_vscheduled_users"
     )
     if rc != 0:
         err(f"Failed to INSERT into zadmin.vscheduled_users (see log {logf})"); sys.exit(1)
-    ok("vscheduled_users populated (no duplicates added)")
+    m = re.search(r"(\d+|no) rows? (created|inserted)", out, flags=re.IGNORECASE)
+    ok(f"vscheduled_users populated (no duplicates added){': ' + m.group(0) if m else ''}")
 
     # 3) PreCopy session create on TARGET  (feeds answers for ACCEPT)
     say(f"{CYN}==> Running 0.1_pre-copy_session_create.sql on TARGET (UMOVE){NC}")
     pre_copy_path = PRECOPY_SQL_DIR / "0.1_pre-copy_session_create.sql"
-    if not pre_copy_path.exists():
+    if not pre_copy_path.is_file():
         err(f"Script not found: {pre_copy_path}"); sys.exit(1)
 
-    sess_call_log = (logs_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_precopy_session_create_call.log")
+    # Пути spool — абсолютные: sqlplus запускается с cwd=PRECOPY_SQL_DIR, и относительный
+    # 'logs/...' писался в PRECOPY_SQL_DIR/logs (или не писался вовсе, если каталога нет).
+    sess_call_log = logs_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_precopy_session_create_call.log"
     wrapper = f"""
 spool {sess_call_log.as_posix()} append
 whenever sqlerror exit 1
@@ -331,7 +414,7 @@ prompt === 0.1_pre-copy_session_create.sql END ===
 spool off
 """
     rc, out1, logf1 = sqlplus_exec(
-        f"{UMOVE_USER}/{UMOVE_PASS}@{TARGET_DB}",
+        UMOVE_USER, UMOVE_PASS, TARGET_DB,
         wrapper,
         env=env, tag="precopy_session_create", cwd=PRECOPY_SQL_DIR
     )
@@ -342,15 +425,18 @@ spool off
     # 4) PreCopyLogs: generate TMP then execute it (feeds answers for ACCEPT)
     say(f"{CYN}==> Running 0.2_pre-copylogs.sql (generate TMP) and executing TMP on TARGET{NC}")
     pre_logs_path = PRECOPY_SQL_DIR / "0.2_pre-copylogs.sql"
-    if not pre_logs_path.exists():
+    if not pre_logs_path.is_file():
         err(f"Script not found: {pre_logs_path}"); sys.exit(1)
 
     # очистим старые TMP, чтобы не путать поиск
     for p in PRECOPY_SQL_DIR.glob("tmp_*.sql"):
-        try: p.unlink()
-        except: pass
+        try:
+            p.unlink()
+        except OSError as e:
+            warn(f"Cannot remove old {p}: {e}")
+    gen_started = datetime.now().timestamp()
 
-    logs_call = (logs_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_precopylogs_gen_call.log")
+    logs_call = logs_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_precopylogs_gen_call.log"
     gen = f"""
 spool {logs_call.as_posix()} append
 whenever sqlerror exit 1
@@ -365,39 +451,43 @@ prompt === 0.2_pre-copylogs.sql END ===
 spool off
 """
     rc, out2, logf2 = sqlplus_exec(
-        f"{UMOVE_USER}/{UMOVE_PASS}@{TARGET_DB}",
+        UMOVE_USER, UMOVE_PASS, TARGET_DB,
         gen,
         env=env, tag="precopylogs_gen", cwd=PRECOPY_SQL_DIR
     )
     if rc != 0:
         err(f"0.2_pre-copylogs.sql failed (see log {logf2})"); sys.exit(1)
 
-    # Поиск нового TMP в каталоге pre-copy
+    # Поиск нового TMP в каталоге pre-copy: сначала по имени из вывода, затем — самый
+    # свежий tmp_*.sql, созданный после запуска генератора.
     tmp_sql = None
-    m = re.search(r"tmp_([\w\-]+)\.sql", (out2 or ""), flags=re.IGNORECASE)
-    if m:
-        tmp_sql = PRECOPY_SQL_DIR / f"tmp_{m.group(1)}.sql"
-    else:
-        cands = sorted(PRECOPY_SQL_DIR.glob("tmp_*.sql"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for m in re.finditer(r"tmp_[\w\-]+\.sql", out2, flags=re.IGNORECASE):
+        cand = PRECOPY_SQL_DIR / m.group(0)
+        if cand.is_file():
+            tmp_sql = cand
+    if tmp_sql is None:
+        cands = sorted((p for p in PRECOPY_SQL_DIR.glob("tmp_*.sql") if p.stat().st_mtime >= gen_started - 1),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
         if cands:
             tmp_sql = cands[0]
-    if not tmp_sql or not tmp_sql.exists():
-        err(f"TMP file not found after generator: expected {PRECOPY_SQL_DIR}/tmp_*.sql"); sys.exit(1)
+    if tmp_sql is None:
+        err(f"TMP file not found after generator: expected {PRECOPY_SQL_DIR}/tmp_*.sql (see log {logf2})"); sys.exit(1)
+    if tmp_sql.stat().st_size == 0:
+        err(f"TMP file {tmp_sql} is empty (see log {logf2})"); sys.exit(1)
 
-    # ---- NEW: autodetect & pass args to TMP (&1=TransferNo, &2=ACTIVE_DBLINK) ----
+    # ---- autodetect & pass args to TMP (&1=TransferNo, &2=ACTIVE_DBLINK) ----
     argc = detect_tmp_argc(tmp_sql)
     args_str = ""
-    transfer_no = None
+    transfer_no = guess_transfer_no([sess_call_log, logf1])
     if argc >= 1:
-        transfer_no = guess_transfer_no(logs_dir)
         if not transfer_no:
-            err("Cannot detect TransferNo for TMP execution (&1). Check 0.1 logs."); sys.exit(1)
+            err(f"Cannot detect TransferNo for TMP execution (&1). Check 0.1 logs: {logf1}"); sys.exit(1)
         args_str = f" {transfer_no}"
     if argc >= 2:
         args_str += f" {ACTIVE_DBLINK}"
 
     say(f"{CYN}==> Executing {tmp_sql.name} on TARGET (UMOVE){NC}")
-    tmp_call_log = (logs_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_precopylogs_exec_call.log")
+    tmp_call_log = logs_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_precopylogs_exec_call.log"
     exec_sql = f"""
 spool {tmp_call_log.as_posix()} append
 whenever sqlerror exit 1
@@ -406,12 +496,12 @@ prompt === EXEC TMP BEGIN ===
 prompt CONNECT: {UMOVE_USER}@{TARGET_DB}
 prompt TMP file : {tmp_sql.name}
 prompt TMP args :{args_str or ' <none>'}
-@{tmp_sql.name}{args_str}
+@{tmp_sql.as_posix()}{args_str}
 prompt === EXEC TMP END ===
 spool off
 """
     rc, out3, logf3 = sqlplus_exec(
-        f"{UMOVE_USER}/{UMOVE_PASS}@{TARGET_DB}",
+        UMOVE_USER, UMOVE_PASS, TARGET_DB,
         exec_sql,
         env=env, tag="precopylogs_exec", cwd=PRECOPY_SQL_DIR
     )
@@ -428,4 +518,3 @@ spool off
 
 if __name__ == "__main__":
     main()
-
