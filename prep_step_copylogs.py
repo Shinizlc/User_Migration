@@ -152,7 +152,126 @@ def pick_active_from_list(aliases_csv, um_user, um_pass, env, role_expected=None
     if len(act) > 1:
         err(f"Несколько активных юнитов (read_only_mode = 0): {', '.join(act)}{role}"); sys.exit(1)
     ok(f"Определён активный юнит ({role_expected or 'DB'}): {act[0]}" + (f"; пассивные: {', '.join(pas)}" if pas else ""))
-    return act[0], pas
+    # для DB links нужны все остальные юниты, в т.ч. недоступные сейчас
+    return act[0], [a for a in aliases if a != act[0]]
+
+# ---------- topology / paths: всё, что можно, вычисляется из config.ini ----------
+
+def opt_cfg(cfg, section, option) -> Optional[str]:
+    """Значение опции или None, если её нет или она пустая."""
+    if cfg.has_option(section, option):
+        v = cfg.get(section, option).strip()
+        return v or None
+    return None
+
+def unit_to_dblink(alias: str) -> str:
+    """PRO-ADB252 -> ADB252 (имя DB link и TNS-алиас source-юнита на стороне TARGET)."""
+    m = re.search(r"ADB\d+", alias, flags=re.IGNORECASE)
+    return (m.group(0) if m else alias.split("-")[-1]).upper()
+
+def dblink_to_pod(name: str) -> Optional[int]:
+    """ADB252 -> 25: номер POD = цифры без последней (последняя — номер юнита)."""
+    m = re.fullmatch(r"ADB(\d+)\d", name or "", flags=re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+def opt_int(cfg, section, option) -> Optional[int]:
+    v = opt_cfg(cfg, section, option)
+    if v is None:
+        return None
+    if not v.isdigit():
+        err(f"Config '{section}.{option}' must be a number, got '{v}'"); sys.exit(1)
+    return int(v)
+
+def resolve_topology(cfg, um_user, um_pass, env) -> dict:
+    """
+    Из [db] source_db_units / target_db_units определяет:
+      source_db / target_db       — активные юниты (read_only_mode = 0);
+      active_dblink               — DB link на активный source-юнит (PRO-ADB252 -> ADB252);
+      passive_dblinks             — DB links на остальные source-юниты;
+      source_pod / target_pod     — номера POD (ADB252 -> 25, ADB232 -> 23).
+    Явные значения в config.ini ([links] active_src_dblink/passive_src_dblink/src_podid,
+    [prep] source_pod_id/vsched_target_pod) необязательны и нужны только для переопределения
+    или для старого режима source_db_tns/target_db_tns.
+    """
+    t = {}
+    src_units = opt_cfg(cfg, "db", "source_db_units")
+    tgt_units = opt_cfg(cfg, "db", "target_db_units")
+
+    derived_active, derived_passive = None, []
+    if src_units:
+        say(f"{CYN}==> Определяю активный юнит для SOURCE из: {src_units}{NC}")
+        t["source_db"], others = pick_active_from_list(src_units, um_user, um_pass, env, "source")
+        derived_active = unit_to_dblink(t["source_db"])
+        derived_passive = [unit_to_dblink(o) for o in others]
+    else:
+        t["source_db"] = cfg_get(cfg, "db", "source_db_tns")
+
+    if tgt_units:
+        say(f"{CYN}==> Определяю активный юнит для TARGET из: {tgt_units}{NC}")
+        t["target_db"], _ = pick_active_from_list(tgt_units, um_user, um_pass, env, "target")
+    else:
+        t["target_db"] = cfg_get(cfg, "db", "target_db_tns")
+
+    # --- DB links на source ---
+    cfg_active = opt_cfg(cfg, "links", "active_src_dblink")
+    if cfg_active and derived_active and cfg_active.upper() != derived_active:
+        # жёстко заданный «активный» линк после переключения юнитов указывал бы на пассивный
+        err(f"links.active_src_dblink = {cfg_active}, но активный source-юнит сейчас {t['source_db']} "
+            f"({derived_active}). Удалите active_src_dblink из config.ini — он вычисляется автоматически.")
+        sys.exit(1)
+    t["active_dblink"] = (cfg_active or derived_active or "").upper()
+    if not t["active_dblink"]:
+        err("Не задан DB link на source: укажите [db] source_db_units или [links] active_src_dblink"); sys.exit(1)
+
+    cfg_passive = opt_cfg(cfg, "links", "passive_src_dblink")
+    t["passive_dblinks"] = [cfg_passive.upper()] if cfg_passive else derived_passive
+    t["passive_dblinks"] = [p for p in t["passive_dblinks"] if p != t["active_dblink"]]
+    if not t["passive_dblinks"]:
+        warn("Пассивный source DB link не определён — проверяю только активный.")
+
+    # --- POD id ---
+    pod_src_a = opt_int(cfg, "prep", "source_pod_id")
+    pod_src_b = opt_int(cfg, "links", "src_podid")
+    if pod_src_a is not None and pod_src_b is not None and pod_src_a != pod_src_b:
+        err(f"prep.source_pod_id={pod_src_a} и links.src_podid={pod_src_b} различаются — оставьте одно."); sys.exit(1)
+    t["source_pod"] = _pod_with_override(pod_src_a if pod_src_a is not None else pod_src_b,
+                                         dblink_to_pod(t["active_dblink"]), "source")
+    t["target_pod"] = _pod_with_override(opt_int(cfg, "prep", "vsched_target_pod"),
+                                         dblink_to_pod(unit_to_dblink(t["target_db"])), "target")
+
+    say(f"    SOURCE: {t['source_db']}  (POD {t['source_pod']}, dblink {t['active_dblink']}"
+        + (f", passive {', '.join(t['passive_dblinks'])}" if t["passive_dblinks"] else "") + ")")
+    say(f"    TARGET: {t['target_db']}  (POD {t['target_pod']})")
+    return t
+
+def _pod_with_override(explicit: Optional[int], derived: Optional[int], role: str) -> Optional[int]:
+    if explicit is not None:
+        if derived is not None and derived != explicit:
+            warn(f"POD {role}: в config.ini задан {explicit}, по имени юнита получается {derived} — использую {explicit}.")
+        return explicit
+    return derived
+
+def require_pod(t: dict, key: str, cfg_hint: str) -> int:
+    if t.get(key) is None:
+        err(f"Не удалось определить {key} по имени юнита — задайте {cfg_hint} в config.ini"); sys.exit(1)
+    return t[key]
+
+def resolve_paths(cfg) -> dict:
+    """Все каталоги по умолчанию строятся от [paths] release_root; каждый можно переопределить."""
+    root = opt_cfg(cfg, "paths", "release_root")
+    def path(option, default_rel):
+        v = opt_cfg(cfg, "paths", option)
+        if v:
+            return Path(v).expanduser()
+        if root is None:
+            err(f"Задайте [paths] release_root (или {option})"); sys.exit(1)
+        return Path(root).expanduser() / default_rel
+    return {
+        "sql_dir":         path("sql_dir", "tools/sql"),
+        "precopy_sql_dir": path("precopy_sql_dir", "."),
+        "work_dir":        path("work_dir", "."),
+        "extdata_bin":     path("extdata_bin", "extdata/extdata"),
+    }
 
 # ---------- logic pieces ----------
 
@@ -318,38 +437,21 @@ def main():
     if not UMOVE_USER or not UMOVE_PASS:
         err("UMOVE creds are required (set UMOVE_USER/UMOVE_PASS or config)"); sys.exit(1)
 
-    # resolve SOURCE/TARGET TNS
-    SOURCE_UNITS = cfg.get("db", "source_db_units", fallback="").strip()
-    TARGET_UNITS = cfg.get("db", "target_db_units", fallback="").strip()
+    # SOURCE/TARGET, DB links и POD id — из списков юнитов
+    topo = resolve_topology(cfg, UMOVE_USER, UMOVE_PASS, env)
+    SOURCE_DB, TARGET_DB = topo["source_db"], topo["target_db"]
+    ACTIVE_DBLINK = topo["active_dblink"]
+    source_pod_id = require_pod(topo, "source_pod", "[prep] source_pod_id")
+    target_pod    = require_pod(topo, "target_pod", "[prep] vsched_target_pod")
 
-    if SOURCE_UNITS:
-        say(f"{CYN}==> Определяю активный юнит для SOURCE из: {SOURCE_UNITS}{NC}")
-        SOURCE_DB, _ = pick_active_from_list(SOURCE_UNITS, UMOVE_USER, UMOVE_PASS, env, "source")
-    else:
-        SOURCE_DB = cfg_get(cfg, "db", "source_db_tns")
-
-    if TARGET_UNITS:
-        say(f"{CYN}==> Определяю активный юнит для TARGET из: {TARGET_UNITS}{NC}")
-        TARGET_DB, _ = pick_active_from_list(TARGET_UNITS, UMOVE_USER, UMOVE_PASS, env, "target")
-    else:
-        TARGET_DB = cfg_get(cfg, "db", "target_db_tns")
-
-    # links + paths + prep params
-    ACTIVE_DBLINK  = cfg_get(cfg, "links", "active_src_dblink")
-    PASSIVE_DBLINK = cfg_get(cfg, "links", "passive_src_dblink")
-
-    SQL_DIR         = Path(cfg_get(cfg, "paths", "sql_dir"))
-    PRECOPY_SQL_DIR = Path(cfg.get("paths", "precopy_sql_dir", fallback=str(SQL_DIR))).resolve()
-    WORK_DIR        = Path(cfg.get("paths", "work_dir", fallback=".")).resolve()
+    paths = resolve_paths(cfg)
+    PRECOPY_SQL_DIR = paths["precopy_sql_dir"].resolve()
+    WORK_DIR        = paths["work_dir"].resolve()
     WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-    try:
-        target_pod    = int(cfg_get(cfg, "prep", "vsched_target_pod"))
-        brand_id      = int(cfg.get("prep", "brand_id", fallback="0") or 0)
-        source_pod_id = int(cfg_get(cfg, "prep", "source_pod_id"))
-        flags = {k: int(cfg_get(cfg, "prep", f"ext_migrate_{k}")) for k in ("mss", "lds", "hit", "mds", "rcv")}
-    except ValueError as e:
-        err(f"Invalid numeric value in [prep] section: {e}"); sys.exit(1)
+    brand_id = opt_int(cfg, "prep", "brand_id") or 0
+    # ext_migrate_* по умолчанию 0 — в config.ini указываются только включённые
+    flags = {k: opt_int(cfg, "prep", f"ext_migrate_{k}") or 0 for k in ("mss", "lds", "hit", "mds", "rcv")}
     vip_code = cfg_get(cfg, "prep", "vip_code_name")
 
     # 0) connectivity sanity (UMOVE to both)
@@ -366,8 +468,8 @@ def main():
 
     # 1) Ensure DB links on TARGET (UMOVE) and ping
     say(f"{CYN}==> Ensuring DB links exist on TARGET (UMOVE){NC}")
-    ensure_dblink_exists(TARGET_DB, ACTIVE_DBLINK,  UMOVE_USER, UMOVE_PASS, env)
-    ensure_dblink_exists(TARGET_DB, PASSIVE_DBLINK, UMOVE_USER, UMOVE_PASS, env)
+    for link in [ACTIVE_DBLINK] + topo["passive_dblinks"]:
+        ensure_dblink_exists(TARGET_DB, link, UMOVE_USER, UMOVE_PASS, env)
 
     # 2) Populate ZADMIN.VSCHEDULED_USERS on SOURCE (method A) — idempotent
     say(f"{CYN}==> Populating ZADMIN.VSCHEDULED_USERS on SOURCE via method A (idempotent){NC}")
