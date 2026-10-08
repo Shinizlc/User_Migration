@@ -229,32 +229,43 @@ def resolve_topology(cfg, um_user, um_pass, env) -> dict:
     if not t["passive_dblinks"]:
         warn("Пассивный source DB link не определён — проверяю только активный.")
 
-    # --- POD id ---
+    # --- POD id: берём из самих баз (zportal.getbuzmeparameter('PODID')) ---
+    # 0.1_pre-copy_session_create.sql сравнивает scheduled_users.podid с PODID таргета,
+    # а PODID источника — с тем, что вернёт DB link. Поэтому значения должны быть точными.
     pod_src_a = opt_int(cfg, "prep", "source_pod_id")
     pod_src_b = opt_int(cfg, "links", "src_podid")
     if pod_src_a is not None and pod_src_b is not None and pod_src_a != pod_src_b:
         err(f"prep.source_pod_id={pod_src_a} и links.src_podid={pod_src_b} различаются — оставьте одно."); sys.exit(1)
-    t["source_pod"] = _pod_with_override(pod_src_a if pod_src_a is not None else pod_src_b,
-                                         dblink_to_pod(t["active_dblink"]), "source")
-    t["target_pod"] = _pod_with_override(opt_int(cfg, "prep", "vsched_target_pod"),
-                                         dblink_to_pod(unit_to_dblink(t["target_db"])), "target")
+    t["source_pod"] = _check_pod(get_podid(t["source_db"], um_user, um_pass, env),
+                                 pod_src_a if pod_src_a is not None else pod_src_b,
+                                 dblink_to_pod(t["active_dblink"]), "source", "[prep] source_pod_id")
+    t["target_pod"] = _check_pod(get_podid(t["target_db"], um_user, um_pass, env),
+                                 opt_int(cfg, "prep", "vsched_target_pod"),
+                                 dblink_to_pod(unit_to_dblink(t["target_db"])), "target", "[prep] vsched_target_pod")
 
     say(f"    SOURCE: {t['source_db']}  (POD {t['source_pod']}, dblink {t['active_dblink']}"
         + (f", passive {', '.join(t['passive_dblinks'])}" if t["passive_dblinks"] else "") + ")")
     say(f"    TARGET: {t['target_db']}  (POD {t['target_pod']})")
     return t
 
-def _pod_with_override(explicit: Optional[int], derived: Optional[int], role: str) -> Optional[int]:
-    if explicit is not None:
-        if derived is not None and derived != explicit:
-            warn(f"POD {role}: в config.ini задан {explicit}, по имени юнита получается {derived} — использую {explicit}.")
-        return explicit
-    return derived
+def get_podid(alias, um_user, um_pass, env) -> int:
+    rc, out, logf = sqlplus_exec(
+        um_user, um_pass, alias,
+        "whenever sqlerror exit 1;\nset head off pages 0 feed off\n"
+        "select 'PODID=' || zportal.getbuzmeparameter('PODID') from dual;\n",
+        env=env, tag=f"{alias}_podid", timeout=PROBE_TIMEOUT)
+    m = re.search(r"PODID=(\d+)", out)
+    if rc != 0 or not m:
+        err(f"Не удалось прочитать PODID на {alias} (see log {logf})"); sys.exit(1)
+    return int(m.group(1))
 
-def require_pod(t: dict, key: str, cfg_hint: str) -> int:
-    if t.get(key) is None:
-        err(f"Не удалось определить {key} по имени юнита — задайте {cfg_hint} в config.ini"); sys.exit(1)
-    return t[key]
+def _check_pod(actual: int, explicit: Optional[int], by_name: Optional[int], role: str, cfg_key: str) -> int:
+    if explicit is not None and explicit != actual:
+        err(f"POD {role}: в config.ini {cfg_key} = {explicit}, а в базе PODID = {actual}. "
+            f"Удалите {cfg_key} из config.ini — значение читается из базы."); sys.exit(1)
+    if by_name is not None and by_name != actual:
+        warn(f"POD {role}: по имени юнита получается {by_name}, в базе PODID = {actual} — использую {actual}.")
+    return actual
 
 def resolve_paths(cfg) -> dict:
     """Все каталоги по умолчанию строятся от [paths] release_root; каждый можно переопределить."""
@@ -275,7 +286,7 @@ def resolve_paths(cfg) -> dict:
 
 # ---------- logic pieces ----------
 
-def ensure_dblink_exists(target_db, dblink_name, um_user, um_pass, env):
+def ensure_dblink_exists(target_db, dblink_name, um_user, um_pass, env, expected_pod: Optional[int] = None):
     name_up = dblink_name.upper()
     check_sql = f"""
 whenever sqlerror exit 1;
@@ -320,6 +331,19 @@ END;
     if rc3 != 0 or "PING_OK" not in out3:
         err(f"DB link {name_up} exists but connectivity failed (see log {logf3})"); sys.exit(1)
     ok(f"DB link {name_up} is reachable.")
+
+    if expected_pod is not None:
+        # та же проверка, что делают 0.1/0.2: линк должен смотреть на нужный POD
+        pod_sql = (f"whenever sqlerror exit 1;\nset head off pages 0 feed off\n"
+                   f"select 'PODID=' || zportal.getbuzmeparameter@{name_up}('PODID') from dual;\n")
+        rc4, out4, logf4 = sqlplus_exec(um_user, um_pass, target_db, pod_sql, env=env,
+                                        tag=f"podid_dblink_{name_up}", timeout=PROBE_TIMEOUT)
+        m = re.search(r"PODID=(\d+)", out4)
+        if rc4 != 0 or not m:
+            err(f"Cannot read PODID via DB link {name_up} (see log {logf4})"); sys.exit(1)
+        if int(m.group(1)) != expected_pod:
+            err(f"DB link {name_up} points to POD {m.group(1)}, expected POD {expected_pod}"); sys.exit(1)
+        ok(f"DB link {name_up} points to POD {expected_pod}.")
 
 # ----- idempotent INSERT into zadmin.vscheduled_users (method A) -----
 
@@ -370,43 +394,24 @@ SELECT u.userid,
 COMMIT;
 """
 
-# ----- TMP helpers -----
+# ----- TMP, который генерирует 0.2_pre-copylogs.sql -----
+#
+# 0.2 пишет tmp_<instance_name таргета>.sql вида:
+#   spool ./logs/copylogs_<instance>.log append
+#   alter session set time_zone = 'UTC'          <- без ';' (PROMPT срезает его)
+#   ...
+#   @2.0_copylogs.sql <transfer_no> <dblink>      <- по строке на каждую transfer-сессию
+#   spool off
+#   exit
+# Сам TMP не исполняем: строки после 'alter session' без терминатора sqlplus может
+# склеить в один SQL-буфер, и @2.0_copylogs не выполнится. Вместо этого берём из TMP
+# пары (transfer_no, dblink) и запускаем 2.0_copylogs.sql для каждой сами.
 
-def detect_tmp_argc(tmp_path: Path) -> int:
-    """Return how many positional args (&1, &2) are referenced by tmp SQL."""
-    try:
-        txt = tmp_path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return 0
-    argc = 0
-    if re.search(r'&\s*1\b', txt): argc = 1
-    if re.search(r'&\s*2\b', txt): argc = 2
-    return argc
+COPYLOGS_LINE = re.compile(r"^\s*@@?\s*2\.0_copylogs\.sql\s+(\d+)\s+(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
 
-def guess_transfer_no(files: List[Path]) -> Optional[str]:
-    """
-    Ищет TransferNo только в логах ТЕКУЩЕГО запуска 0.1 (раньше брались любые *.log
-    в ./logs — при неудаче текущего запуска подхватывался номер из старого прогона).
-    Берётся последнее по тексту совпадение: с 'set echo on' в начале лога лежит
-    исходник скрипта (например, 'vTransferNo number := 0'), а реальное значение — ниже.
-    """
-    pats = [
-        r'\bTransfer\s*No\b\s*[:=]\s*(\d+)',
-        r'\bTRANSFERNO\b\s*[:=]\s*(\d+)',
-        r'vTransferNo\s*number\s*:?\s*=\s*(\d+)',
-    ]
-    for p in files:
-        if not p or not p.is_file():
-            continue
-        txt = p.read_text(encoding="utf-8", errors="ignore")
-        best = None
-        for rgx in pats:
-            for m in re.finditer(rgx, txt, flags=re.IGNORECASE):
-                if best is None or m.start() > best.start():
-                    best = m
-        if best and int(best.group(1)) > 0:
-            return best.group(1)
-    return None
+def parse_tmp_transfers(tmp_path: Path) -> List[tuple]:
+    txt = tmp_path.read_text(encoding="utf-8", errors="replace")
+    return [(m.group(1), m.group(2)) for m in COPYLOGS_LINE.finditer(txt)]
 
 # ---------- main ----------
 
@@ -441,8 +446,8 @@ def main():
     topo = resolve_topology(cfg, UMOVE_USER, UMOVE_PASS, env)
     SOURCE_DB, TARGET_DB = topo["source_db"], topo["target_db"]
     ACTIVE_DBLINK = topo["active_dblink"]
-    source_pod_id = require_pod(topo, "source_pod", "[prep] source_pod_id")
-    target_pod    = require_pod(topo, "target_pod", "[prep] vsched_target_pod")
+    source_pod_id = topo["source_pod"]
+    target_pod    = topo["target_pod"]
 
     paths = resolve_paths(cfg)
     PRECOPY_SQL_DIR = paths["precopy_sql_dir"].resolve()
@@ -469,7 +474,8 @@ def main():
     # 1) Ensure DB links on TARGET (UMOVE) and ping
     say(f"{CYN}==> Ensuring DB links exist on TARGET (UMOVE){NC}")
     for link in [ACTIVE_DBLINK] + topo["passive_dblinks"]:
-        ensure_dblink_exists(TARGET_DB, link, UMOVE_USER, UMOVE_PASS, env)
+        ensure_dblink_exists(TARGET_DB, link, UMOVE_USER, UMOVE_PASS, env,
+                             expected_pod=topo["source_pod"] if link == ACTIVE_DBLINK else None)
 
     # 2) Populate ZADMIN.VSCHEDULED_USERS on SOURCE (method A) — idempotent
     say(f"{CYN}==> Populating ZADMIN.VSCHEDULED_USERS on SOURCE via method A (idempotent){NC}")
@@ -492,28 +498,25 @@ def main():
     m = re.search(r"(\d+|no) rows? (created|inserted)", out, flags=re.IGNORECASE)
     ok(f"vscheduled_users populated (no duplicates added){': ' + m.group(0) if m else ''}")
 
-    # 3) PreCopy session create on TARGET  (feeds answers for ACCEPT)
+    # 0.1/0.2 спулят в относительный ./logs — относительно каталога релиза
+    (PRECOPY_SQL_DIR / "logs").mkdir(exist_ok=True)
+
+    # 3) PreCopy session create on TARGET.
+    # 0.1 спрашивает 3 ACCEPT: SourcePODID, SourceDBLink, BRAND_ID; сам спулит в
+    # ./logs/session_create.log и заканчивается EXIT. Номер transfer-сессии он не печатает,
+    # только 'Total users processed: N'.
     say(f"{CYN}==> Running 0.1_pre-copy_session_create.sql on TARGET (UMOVE){NC}")
     pre_copy_path = PRECOPY_SQL_DIR / "0.1_pre-copy_session_create.sql"
     if not pre_copy_path.is_file():
         err(f"Script not found: {pre_copy_path}"); sys.exit(1)
 
-    # Пути spool — абсолютные: sqlplus запускается с cwd=PRECOPY_SQL_DIR, и относительный
-    # 'logs/...' писался в PRECOPY_SQL_DIR/logs (или не писался вовсе, если каталога нет).
-    sess_call_log = logs_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_precopy_session_create_call.log"
     wrapper = f"""
-spool {sess_call_log.as_posix()} append
 whenever sqlerror exit 1
-set echo on
-prompt === 0.1_pre-copy_session_create.sql BEGIN ===
-prompt CONNECT: {UMOVE_USER}@{TARGET_DB}
-prompt (feeding answers to ACCEPT below)
+whenever oserror exit 1
 @{pre_copy_path.as_posix()}
 {source_pod_id}
 {ACTIVE_DBLINK}
 {brand_id}
-prompt === 0.1_pre-copy_session_create.sql END ===
-spool off
 """
     rc, out1, logf1 = sqlplus_exec(
         UMOVE_USER, UMOVE_PASS, TARGET_DB,
@@ -521,36 +524,37 @@ spool off
         env=env, tag="precopy_session_create", cwd=PRECOPY_SQL_DIR
     )
     if rc != 0:
-        err(f"PreCopy session create failed (see log {logf1})"); sys.exit(1)
-    ok("PreCopy session created")
+        err(f"PreCopy session create failed (see log {logf1}, {PRECOPY_SQL_DIR}/logs/session_create.log)"); sys.exit(1)
+    m = re.search(r"Total users processed:\s*(\d+)", out1)
+    if not m:
+        warn(f"0.1 не вывел 'Total users processed' — проверьте лог {logf1}")
+    elif int(m.group(1)) == 0:
+        warn("0.1: Total users processed: 0 — новых пользователей в transfer-сессии не добавлено "
+             "(нет записей status=0 для этого POD в scheduled_users источника, они уже в активной "
+             "transfer-сессии, отфильтрованы по brand_id или по userservices.parameter=462).")
+    else:
+        ok(f"PreCopy session created: {m.group(1)} user(s) processed")
 
-    # 4) PreCopyLogs: generate TMP then execute it (feeds answers for ACCEPT)
-    say(f"{CYN}==> Running 0.2_pre-copylogs.sql (generate TMP) and executing TMP on TARGET{NC}")
+    # 4) PreCopyLogs: 0.2 генерирует TMP со списком transfer-сессий, затем копируем логи по каждой.
+    # 0.2 спрашивает 2 ACCEPT: SourcePODID, SourceDBLink.
+    say(f"{CYN}==> Running 0.2_pre-copylogs.sql (generate TMP) on TARGET{NC}")
     pre_logs_path = PRECOPY_SQL_DIR / "0.2_pre-copylogs.sql"
     if not pre_logs_path.is_file():
         err(f"Script not found: {pre_logs_path}"); sys.exit(1)
 
-    # очистим старые TMP, чтобы не путать поиск
+    # очистим старые TMP (tmp_*.sql_bkp не трогаем), чтобы не взять результат прошлого запуска
     for p in PRECOPY_SQL_DIR.glob("tmp_*.sql"):
         try:
             p.unlink()
         except OSError as e:
-            warn(f"Cannot remove old {p}: {e}")
-    gen_started = datetime.now().timestamp()
+            err(f"Cannot remove old {p}: {e}"); sys.exit(1)
 
-    logs_call = logs_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_precopylogs_gen_call.log"
     gen = f"""
-spool {logs_call.as_posix()} append
 whenever sqlerror exit 1
-set echo on
-prompt === 0.2_pre-copylogs.sql BEGIN ===
-prompt CONNECT: {UMOVE_USER}@{TARGET_DB}
-prompt (feeding answers to ACCEPT below)
+whenever oserror exit 1
 @{pre_logs_path.as_posix()}
 {source_pod_id}
 {ACTIVE_DBLINK}
-prompt === 0.2_pre-copylogs.sql END ===
-spool off
 """
     rc, out2, logf2 = sqlplus_exec(
         UMOVE_USER, UMOVE_PASS, TARGET_DB,
@@ -560,60 +564,43 @@ spool off
     if rc != 0:
         err(f"0.2_pre-copylogs.sql failed (see log {logf2})"); sys.exit(1)
 
-    # Поиск нового TMP в каталоге pre-copy: сначала по имени из вывода, затем — самый
-    # свежий tmp_*.sql, созданный после запуска генератора.
-    tmp_sql = None
-    for m in re.finditer(r"tmp_[\w\-]+\.sql", out2, flags=re.IGNORECASE):
-        cand = PRECOPY_SQL_DIR / m.group(0)
-        if cand.is_file():
-            tmp_sql = cand
-    if tmp_sql is None:
-        cands = sorted((p for p in PRECOPY_SQL_DIR.glob("tmp_*.sql") if p.stat().st_mtime >= gen_started - 1),
-                       key=lambda p: p.stat().st_mtime, reverse=True)
-        if cands:
-            tmp_sql = cands[0]
-    if tmp_sql is None:
-        err(f"TMP file not found after generator: expected {PRECOPY_SQL_DIR}/tmp_*.sql (see log {logf2})"); sys.exit(1)
-    if tmp_sql.stat().st_size == 0:
-        err(f"TMP file {tmp_sql} is empty (see log {logf2})"); sys.exit(1)
+    tmps = sorted(PRECOPY_SQL_DIR.glob("tmp_*.sql"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not tmps:
+        err(f"TMP file not found after 0.2: expected {PRECOPY_SQL_DIR}/tmp_<instance>.sql (see log {logf2})"); sys.exit(1)
+    tmp_sql = tmps[0]
+    instance = tmp_sql.stem[len("tmp_"):]
+    transfers = parse_tmp_transfers(tmp_sql)
+    ok(f"{tmp_sql.name}: transfer-сессий для копирования логов: {len(transfers)}")
 
-    # ---- autodetect & pass args to TMP (&1=TransferNo, &2=ACTIVE_DBLINK) ----
-    argc = detect_tmp_argc(tmp_sql)
-    args_str = ""
-    transfer_no = guess_transfer_no([sess_call_log, logf1])
-    if argc >= 1:
-        if not transfer_no:
-            err(f"Cannot detect TransferNo for TMP execution (&1). Check 0.1 logs: {logf1}"); sys.exit(1)
-        args_str = f" {transfer_no}"
-    if argc >= 2:
-        args_str += f" {ACTIVE_DBLINK}"
+    if not transfers:
+        warn("0.2 не нашёл transfer-сессий для копирования логов (status null/1/2, "
+             "log_continue_dt пуст или старше вчерашнего дня) — копировать нечего.")
 
-    say(f"{CYN}==> Executing {tmp_sql.name} on TARGET (UMOVE){NC}")
-    tmp_call_log = logs_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_precopylogs_exec_call.log"
-    exec_sql = f"""
-spool {tmp_call_log.as_posix()} append
+    for tno, link in transfers:
+        if link.upper() != ACTIVE_DBLINK:
+            warn(f"transfer {tno}: в TMP dblink {link}, ожидался {ACTIVE_DBLINK} — использую указанный в TMP.")
+        say(f"{CYN}==> 2.0_copylogs.sql {tno} {link}{NC}")
+        exec_sql = f"""
 whenever sqlerror exit 1
-set echo on
-prompt === EXEC TMP BEGIN ===
-prompt CONNECT: {UMOVE_USER}@{TARGET_DB}
-prompt TMP file : {tmp_sql.name}
-prompt TMP args :{args_str or ' <none>'}
-@{tmp_sql.as_posix()}{args_str}
-prompt === EXEC TMP END ===
+whenever oserror exit 1
+alter session set time_zone = 'UTC';
+set serveroutput on size 1000000
+spool ./logs/copylogs_{instance}.log append
+@2.0_copylogs.sql {tno} {link}
 spool off
 """
-    rc, out3, logf3 = sqlplus_exec(
-        UMOVE_USER, UMOVE_PASS, TARGET_DB,
-        exec_sql,
-        env=env, tag="precopylogs_exec", cwd=PRECOPY_SQL_DIR
-    )
-    if rc != 0:
-        err(f"TMP execution failed (see log {logf3})"); sys.exit(1)
-    ok("PreCopyLogs done (TMP executed)")
+        rc, out3, logf3 = sqlplus_exec(
+            UMOVE_USER, UMOVE_PASS, TARGET_DB,
+            exec_sql,
+            env=env, tag=f"copylogs_{tno}", cwd=PRECOPY_SQL_DIR
+        )
+        if rc != 0:
+            err(f"2.0_copylogs.sql failed for transfer {tno} (see log {logf3}, "
+                f"{PRECOPY_SQL_DIR}/logs/copylogs_{instance}.log)"); sys.exit(1)
+        ok(f"copylogs done for transfer {tno}")
 
-    # (опц.) сохраним TransferNo для последующих шагов
-    if transfer_no:
-        (WORK_DIR / "transferno.txt").write_text(str(transfer_no))
+    # список transfer-сессий для последующих шагов
+    (WORK_DIR / "transferno.txt").write_text("".join(f"{tno}\n" for tno, _ in transfers))
 
     say("")
     ok("Preparation Steps completed.")

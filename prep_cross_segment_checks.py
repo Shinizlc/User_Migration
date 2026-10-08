@@ -227,32 +227,43 @@ def resolve_topology(cfg, um_user, um_pass, env) -> dict:
     if not t["passive_dblinks"]:
         warn("Пассивный source DB link не определён — проверяю только активный.")
 
-    # --- POD id ---
+    # --- POD id: берём из самих баз (zportal.getbuzmeparameter('PODID')) ---
+    # 0.1_pre-copy_session_create.sql сравнивает scheduled_users.podid с PODID таргета,
+    # а PODID источника — с тем, что вернёт DB link. Поэтому значения должны быть точными.
     pod_src_a = opt_int(cfg, "prep", "source_pod_id")
     pod_src_b = opt_int(cfg, "links", "src_podid")
     if pod_src_a is not None and pod_src_b is not None and pod_src_a != pod_src_b:
         err(f"prep.source_pod_id={pod_src_a} и links.src_podid={pod_src_b} различаются — оставьте одно."); sys.exit(1)
-    t["source_pod"] = _pod_with_override(pod_src_a if pod_src_a is not None else pod_src_b,
-                                         dblink_to_pod(t["active_dblink"]), "source")
-    t["target_pod"] = _pod_with_override(opt_int(cfg, "prep", "vsched_target_pod"),
-                                         dblink_to_pod(unit_to_dblink(t["target_db"])), "target")
+    t["source_pod"] = _check_pod(get_podid(t["source_db"], um_user, um_pass, env),
+                                 pod_src_a if pod_src_a is not None else pod_src_b,
+                                 dblink_to_pod(t["active_dblink"]), "source", "[prep] source_pod_id")
+    t["target_pod"] = _check_pod(get_podid(t["target_db"], um_user, um_pass, env),
+                                 opt_int(cfg, "prep", "vsched_target_pod"),
+                                 dblink_to_pod(unit_to_dblink(t["target_db"])), "target", "[prep] vsched_target_pod")
 
     say(f"    SOURCE: {t['source_db']}  (POD {t['source_pod']}, dblink {t['active_dblink']}"
         + (f", passive {', '.join(t['passive_dblinks'])}" if t["passive_dblinks"] else "") + ")")
     say(f"    TARGET: {t['target_db']}  (POD {t['target_pod']})")
     return t
 
-def _pod_with_override(explicit: Optional[int], derived: Optional[int], role: str) -> Optional[int]:
-    if explicit is not None:
-        if derived is not None and derived != explicit:
-            warn(f"POD {role}: в config.ini задан {explicit}, по имени юнита получается {derived} — использую {explicit}.")
-        return explicit
-    return derived
+def get_podid(alias, um_user, um_pass, env) -> int:
+    rc, out, logf = sqlplus_exec(
+        um_user, um_pass, alias,
+        "whenever sqlerror exit 1;\nset head off pages 0 feed off\n"
+        "select 'PODID=' || zportal.getbuzmeparameter('PODID') from dual;\n",
+        env=env, tag=f"{alias}_podid", timeout=PROBE_TIMEOUT)
+    m = re.search(r"PODID=(\d+)", out)
+    if rc != 0 or not m:
+        err(f"Не удалось прочитать PODID на {alias} (see log {logf})"); sys.exit(1)
+    return int(m.group(1))
 
-def require_pod(t: dict, key: str, cfg_hint: str) -> int:
-    if t.get(key) is None:
-        err(f"Не удалось определить {key} по имени юнита — задайте {cfg_hint} в config.ini"); sys.exit(1)
-    return t[key]
+def _check_pod(actual: int, explicit: Optional[int], by_name: Optional[int], role: str, cfg_key: str) -> int:
+    if explicit is not None and explicit != actual:
+        err(f"POD {role}: в config.ini {cfg_key} = {explicit}, а в базе PODID = {actual}. "
+            f"Удалите {cfg_key} из config.ini — значение читается из базы."); sys.exit(1)
+    if by_name is not None and by_name != actual:
+        warn(f"POD {role}: по имени юнита получается {by_name}, в базе PODID = {actual} — использую {actual}.")
+    return actual
 
 def resolve_paths(cfg) -> dict:
     """Все каталоги по умолчанию строятся от [paths] release_root; каждый можно переопределить."""
@@ -271,7 +282,7 @@ def resolve_paths(cfg) -> dict:
         "extdata_bin":     path("extdata_bin", "extdata/extdata"),
     }
 
-def ensure_dblink_exists(target_db, dblink_name, um_user, um_pass, env):
+def ensure_dblink_exists(target_db, dblink_name, um_user, um_pass, env, expected_pod: Optional[int] = None):
     name_up = dblink_name.upper()
     check_sql = f"""
 whenever sqlerror exit 1;
@@ -316,6 +327,19 @@ END;
     if rc3 != 0 or "PING_OK" not in out3:
         err(f"DB link {name_up} exists but connectivity failed (see log {logf3})"); sys.exit(1)
     ok(f"DB link {name_up} is reachable.")
+
+    if expected_pod is not None:
+        # та же проверка, что делают 0.1/0.2: линк должен смотреть на нужный POD
+        pod_sql = (f"whenever sqlerror exit 1;\nset head off pages 0 feed off\n"
+                   f"select 'PODID=' || zportal.getbuzmeparameter@{name_up}('PODID') from dual;\n")
+        rc4, out4, logf4 = sqlplus_exec(um_user, um_pass, target_db, pod_sql, env=env,
+                                        tag=f"podid_dblink_{name_up}", timeout=PROBE_TIMEOUT)
+        m = re.search(r"PODID=(\d+)", out4)
+        if rc4 != 0 or not m:
+            err(f"Cannot read PODID via DB link {name_up} (see log {logf4})"); sys.exit(1)
+        if int(m.group(1)) != expected_pod:
+            err(f"DB link {name_up} points to POD {m.group(1)}, expected POD {expected_pod}"); sys.exit(1)
+        ok(f"DB link {name_up} points to POD {expected_pod}.")
 
 # ---------- v_curr_source_scheduled_users.sql patch ----------
 
@@ -431,7 +455,7 @@ def main():
     SOURCE_DB, TARGET_DB = topo["source_db"], topo["target_db"]
     ACTIVE_DBLINK = topo["active_dblink"]
     ALL_DBLINKS = [ACTIVE_DBLINK] + topo["passive_dblinks"]
-    SRC_PODID = str(require_pod(topo, "source_pod", "[prep] source_pod_id"))
+    SRC_PODID = str(topo["source_pod"])
 
     paths = resolve_paths(cfg)
     SQL_DIR = paths["sql_dir"]
@@ -463,7 +487,8 @@ def main():
     # === Ensure DB links exist on TARGET (UMOVE) ===
     say(f"{CYN}==> Ensuring DB links exist on TARGET (UMOVE){NC}")
     for link in ALL_DBLINKS:
-        ensure_dblink_exists(TARGET_DB, link, UMOVE_USER, UMOVE_PASS, env)
+        ensure_dblink_exists(TARGET_DB, link, UMOVE_USER, UMOVE_PASS, env,
+                             expected_pod=topo["source_pod"] if link == ACTIVE_DBLINK else None)
 
     # Validate DB Links on TARGET (UMOVE schema) for active & passive source
     say(f"{CYN}==> Validating DB links on TARGET (user_db_links + v$instance via dblink){NC}")
